@@ -16,10 +16,24 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # loads .env file locally; Railway injects vars automatically
 
 # ── Config ────────────────────────────────────────────────────────────
-BOT_TOKEN        = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # no fallback — fails clearly if missing
+
+if not BOT_TOKEN:
+    raise SystemExit(
+        "\n\n"
+        "❌ ERROR: BOT_TOKEN environment variable is not set!\n"
+        "   → On Railway: go to your service → Variables tab\n"
+        "     → click '+ New Variable'\n"
+        "     → Name: BOT_TOKEN\n"
+        "     → Value: paste your token from @BotFather\n"
+        "     → press Enter → wait for redeploy\n"
+    )
+
+logger_temp = logging.getLogger(__name__)
+logger_temp.info(f"✅ BOT_TOKEN loaded — starts with: {BOT_TOKEN[:10]}...")
 SUBSCRIBERS_FILE = "subscribers.json"
 IST              = pytz.timezone("Asia/Kolkata")
 ALERT_HOUR       = 15
