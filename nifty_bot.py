@@ -1,12 +1,15 @@
 """
-Nifty SIP Strategy Bot — FIXED VERSION
-Fix: replaced APScheduler with PTB's built-in JobQueue
-     removed asyncio.run() — PTB manages its own event loop
+Nifty SIP Strategy Bot — v3 FINAL
+Fixes:
+  1. yfinance: retry logic + 3 fallback methods for reliable Nifty data
+  2. Scheduling: days=(1,2,3,4,5) for Mon-Fri in PTB v20 cron scheme
+  3. Added /test command to manually fire alert any time
 """
 
 import json
 import logging
 import os
+import time as _time
 from datetime import time as dtime
 import pytz
 import yfinance as yf
@@ -16,24 +19,24 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 
-load_dotenv()  # loads .env file locally; Railway injects vars automatically
+load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # no fallback — fails clearly if missing
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise SystemExit(
-        "\n\n"
-        "❌ ERROR: BOT_TOKEN environment variable is not set!\n"
-        "   → On Railway: go to your service → Variables tab\n"
-        "     → click '+ New Variable'\n"
-        "     → Name: BOT_TOKEN\n"
-        "     → Value: paste your token from @BotFather\n"
-        "     → press Enter → wait for redeploy\n"
+        "\n\n❌ ERROR: BOT_TOKEN not set!\n"
+        "   Railway → service → Variables tab → add BOT_TOKEN\n"
     )
 
-logger_temp = logging.getLogger(__name__)
-logger_temp.info(f"✅ BOT_TOKEN loaded — starts with: {BOT_TOKEN[:10]}...")
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+logger.info(f"✅ BOT_TOKEN loaded — starts with: {BOT_TOKEN[:10]}...")
+
 SUBSCRIBERS_FILE = "subscribers.json"
 IST              = pytz.timezone("Asia/Kolkata")
 ALERT_HOUR       = 15
@@ -42,17 +45,10 @@ ALERT_MINUTE     = 0
 DIP_MINOR   = -1.0
 DIP_MAJOR   = -3.0
 DIP_MASSIVE = -5.0
-
 BASE_SIP    = 5000
 EXTRA_MINOR = 3000
 EXTRA_MAJOR = 5000
 EXTRA_MAX   = 10000
-
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
 
 # ── Subscriber Storage ────────────────────────────────────────────────
 def load_subscribers() -> set:
@@ -68,32 +64,59 @@ def save_subscribers(subs: set):
 
 subscribers = load_subscribers()
 
-# ── Nifty Data ────────────────────────────────────────────────────────
+# ── Nifty Data — retry + 3 fallback methods ───────────────────────────
 def get_nifty_data() -> dict:
-    try:
-        ticker = yf.Ticker("^NSEI")
-        hist   = ticker.history(period="5d", interval="1d")
-        if len(hist) < 2:
-            return {"error": "Not enough data — market may be closed"}
+    """
+    Tries multiple methods to fetch Nifty 50 data reliably.
+      Method 1: yf.download("^NSEI")
+      Method 2: yf.download("NIFTY50.NS")
+      Method 3: yf.Ticker("^NSEI").history()
+    Retries up to 3 times with 2s delay between attempts.
+    """
+    methods = [
+        lambda: yf.download("^NSEI",      period="7d", interval="1d", progress=False, auto_adjust=True),
+        lambda: yf.download("NIFTY50.NS", period="7d", interval="1d", progress=False, auto_adjust=True),
+        lambda: yf.Ticker("^NSEI").history(period="7d", interval="1d"),
+    ]
 
-        today_close = float(hist["Close"].iloc[-1])
-        prev_close  = float(hist["Close"].iloc[-2])
-        change_pts  = today_close - prev_close
-        change_pct  = (change_pts / prev_close) * 100
+    for attempt in range(3):
+        for i, method in enumerate(methods):
+            try:
+                hist = method()
+                if hasattr(hist.columns, 'levels'):   # multi-level columns from download
+                    hist.columns = hist.columns.droplevel(1)
+                hist = hist.dropna()
 
-        return {
-            "today":      today_close,
-            "prev":       prev_close,
-            "open":       float(hist["Open"].iloc[-1]),
-            "high":       float(hist["High"].iloc[-1]),
-            "low":        float(hist["Low"].iloc[-1]),
-            "change_pts": change_pts,
-            "change_pct": change_pct,
-            "error":      None,
-        }
-    except Exception as e:
-        logger.error(f"yfinance error: {e}")
-        return {"error": str(e)}
+                if len(hist) < 2:
+                    logger.warning(f"Method {i+1}: only {len(hist)} rows — skipping")
+                    continue
+
+                today_close = float(hist["Close"].iloc[-1])
+                prev_close  = float(hist["Close"].iloc[-2])
+                change_pts  = today_close - prev_close
+                change_pct  = (change_pts / prev_close) * 100
+
+                logger.info(f"✅ Nifty data fetched (method {i+1}, attempt {attempt+1}): {today_close:.0f} ({change_pct:+.2f}%)")
+
+                return {
+                    "today":      today_close,
+                    "prev":       prev_close,
+                    "open":       float(hist["Open"].iloc[-1]),
+                    "high":       float(hist["High"].iloc[-1]),
+                    "low":        float(hist["Low"].iloc[-1]),
+                    "change_pts": change_pts,
+                    "change_pct": change_pct,
+                    "error":      None,
+                }
+            except Exception as e:
+                logger.warning(f"Method {i+1} attempt {attempt+1} failed: {e}")
+                continue
+
+        if attempt < 2:
+            logger.info(f"All methods failed — retrying in 2s (attempt {attempt+1}/3)")
+            _time.sleep(2)
+
+    return {"error": "Could not fetch Nifty data after 3 attempts. Market may be closed or API is down."}
 
 # ── Message Builder ───────────────────────────────────────────────────
 def build_message(data: dict, scheduled: bool = False) -> str:
@@ -142,7 +165,7 @@ def build_message(data: dict, scheduled: bool = False) -> str:
         f"  Prev  : `{data['prev']:>10,.0f}`\n\n"
         f"💡 *Your Action Today*\n   {action}\n\n"
         f"_{tip}_\n\n"
-        f"🤖 _Nifty SIP Bot — share with friends!_"
+        f"🤖 _Nifty SIP Bot — share: t.me/your\_bot\_name_"
     )
 
 # ── Keyboards ─────────────────────────────────────────────────────────
@@ -203,12 +226,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /start  — Subscribe to daily alerts\n"
         "  /stop   — Unsubscribe\n"
         "  /status — Check Nifty right now\n"
+        "  /test   — Manually fire today's alert\n"
         "  /help   — This message\n\n"
         "Daily alert at *3:00 PM IST* (Mon–Fri)\n"
         "Data: NSE via Yahoo Finance 🇮🇳",
         parse_mode="Markdown",
         reply_markup=main_kb(),
     )
+
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually fires the scheduled alert — use to test without waiting for 3 PM."""
+    await update.message.reply_text("🧪 Firing test alert to all subscribers...")
+    await scheduled_alert(context)
+    await update.message.reply_text(f"✅ Test done — sent to {len(subscribers)} subscriber(s).")
 
 # ── Button Handler ────────────────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,8 +253,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await q.edit_message_text(
                 build_message(data, scheduled=False),
-                parse_mode="Markdown",
-                reply_markup=back_kb(),
+                parse_mode="Markdown", reply_markup=back_kb(),
             )
 
     elif q.data == "strategy":
@@ -237,8 +266,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  Below -5%  → ₹15,000 MAX 🔥\n\n"
             "Backtested 2021–2026 — beats plain SIP ✅\n\n"
             "_Be greedy when others are fearful — Buffett_",
-            parse_mode="Markdown",
-            reply_markup=back_kb(),
+            parse_mode="Markdown", reply_markup=back_kb(),
         )
 
     elif q.data == "stats":
@@ -247,8 +275,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Subscribers: *{len(subscribers)}* investors\n"
             f"• Daily alert: *3:00 PM IST* (Mon–Fri)\n"
             f"• Data: Yahoo Finance (NSE)",
-            parse_mode="Markdown",
-            reply_markup=back_kb(),
+            parse_mode="Markdown", reply_markup=back_kb(),
         )
 
     elif q.data == "unsub":
@@ -262,25 +289,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data == "back":
         await q.edit_message_text(
             "👋 *Nifty SIP Bot*\nUse the buttons below:",
-            parse_mode="Markdown",
-            reply_markup=main_kb(),
+            parse_mode="Markdown", reply_markup=main_kb(),
         )
 
-# ── Scheduled Alert — PTB Built-in JobQueue ───────────────────────────
+# ── Scheduled Alert ───────────────────────────────────────────────────
 async def scheduled_alert(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Called by PTB's built-in job queue at 3 PM IST Mon–Fri.
-    NOTE: signature must be (context,) — not (bot,)
-    """
     from datetime import datetime
     now = datetime.now(IST)
     if now.weekday() >= 5:
+        logger.info("Weekend — skipping alert")
         return
 
-    logger.info(f"Daily alert — {now.strftime('%d %b %Y %H:%M IST')}")
+    logger.info(f"🔔 Running alert — {now.strftime('%d %b %Y %H:%M IST')}")
     data = get_nifty_data()
+
     if data["error"]:
-        logger.warning(f"Fetch failed: {data['error']}")
+        logger.warning(f"Data fetch failed: {data['error']}")
+        # Notify subscribers of the fetch failure
+        for uid in list(subscribers):
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"⚠️ Could not fetch Nifty data today.\n_{data['error']}_\nPlease check manually.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
         return
 
     msg  = build_message(data, scheduled=True)
@@ -302,35 +336,34 @@ async def scheduled_alert(context: ContextTypes.DEFAULT_TYPE):
         subscribers.difference_update(dead)
         save_subscribers(subscribers)
 
-    logger.info(
-        f"Sent to {len(subscribers)} | change={data['change_pct']:+.2f}%"
-    )
+    logger.info(f"✅ Alert sent to {len(subscribers)} | {data['change_pct']:+.2f}%")
 
-# ── Main — synchronous, NO asyncio.run() ─────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────
 def main():
-    logger.info("🚀 Starting Nifty SIP Bot (fixed)...")
+    logger.info("🚀 Starting Nifty SIP Bot v3...")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register command handlers
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("stop",   cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("test",   cmd_test))   # ← new test command
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Schedule using PTB's built-in JobQueue — no APScheduler conflict
+    # ── FIX: PTB v20 uses cron weekday scheme ────────────────────────
+    # Cron: Sun=0, Mon=1, Tue=2, Wed=3, Thu=4, Fri=5, Sat=6
+    # So Mon–Fri = (1, 2, 3, 4, 5)  ← was wrong: (0,1,2,3,4) = Sun–Thu!
     alert_time = dtime(hour=ALERT_HOUR, minute=ALERT_MINUTE, tzinfo=IST)
     app.job_queue.run_daily(
         scheduled_alert,
         time=alert_time,
-        days=(0, 1, 2, 3, 4),   # Monday=0 to Friday=4
+        days=(1, 2, 3, 4, 5),       # ✅ Mon=1 to Fri=5 in cron scheme
         name="daily_nifty_alert",
     )
-    logger.info(f"Scheduled daily alert at {ALERT_HOUR:02d}:{ALERT_MINUTE:02d} IST (Mon–Fri)")
-    logger.info(f"Bot is LIVE! Subscribers: {len(subscribers)}")
 
-    # PTB manages its own event loop — do NOT use asyncio.run()
+    logger.info(f"✅ Scheduled: {ALERT_HOUR:02d}:{ALERT_MINUTE:02d} IST Mon–Fri (cron days 1–5)")
+    logger.info(f"✅ Subscribers: {len(subscribers)}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
